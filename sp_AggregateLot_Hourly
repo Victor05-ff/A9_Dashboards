@@ -1,0 +1,123 @@
+CREATE OR ALTER PROCEDURE sp_AggregateLot_Hourly
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    /*
+        PURPOSE:
+        This procedure summarizes raw machine data into hourly production KPIs per LotNumber.
+        It stores the data in the A9_Lot_Hourly table.
+
+        KEY POINTS:
+        - Raw data is logged every 30 seconds in A9_RawMachineData_Log.
+        - This procedure groups that data by LotNumber and hourly timestamp.
+        - KPIs calculated:
+            - Total good products
+            - Total rejects
+            - Run time, planned time, downtime, etc.
+            - Availability %, Performance %, Quality %
+            - OEE % using simplified formula requested by manager
+              → OEE = (GoodCount / (411 * 60)) * 100
+              → Based only on good products per hour vs expected products per minute (411)
+
+        HOW TO USE:
+        - Run this procedure manually:
+              EXEC sp_AggregateLot_Hourly
+        - Or schedule it every 15 minutes using SQL Server Agent
+    */
+
+    -- : Summarize raw data into hourly values per LotNumber
+    WITH HourlySummary AS (
+        SELECT
+            r.LotNumber,
+            -- Round timestamp to the hour for grouping
+            DATEADD(HOUR, DATEDIFF(HOUR, 0, r.Timestamp), 0) AS HourStart,
+
+            -- Raw totals
+            SUM(r.GoodCount) AS TotalGoodCount,
+            SUM(r.RejectCount) AS TotalRejectCount,
+            SUM(r.RunTimeSeconds) AS TotalRunTime,
+            SUM(r.PlannedTimeSeconds) AS TotalPlannedTime,
+            SUM(r.DownTimeSeconds) AS TotalDownTime,
+            SUM(r.AlarmTimeSeconds) AS TotalAlarmTime,
+            SUM(r.WaitTimeSeconds) AS TotalWaitTime
+
+        FROM A9_RawMachineData_Log r
+        GROUP BY 
+            r.LotNumber,
+            DATEADD(HOUR, DATEDIFF(HOUR, 0, r.Timestamp), 0)
+    )
+
+    -- Merge hourly summary into the A9_Lot_Hourly table (insert or update)
+    MERGE A9_Lot_Hourly AS Target
+    USING HourlySummary AS Source
+    ON Target.LotNumber = Source.LotNumber AND Target.HourStart = Source.HourStart
+
+    WHEN MATCHED THEN
+        UPDATE SET
+            -- Update raw totals
+            TotalGoodCount = Source.TotalGoodCount,
+            TotalRejectCount = Source.TotalRejectCount,
+            TotalRunTime = Source.TotalRunTime,
+            TotalPlannedTime = Source.TotalPlannedTime,
+            TotalDownTime = Source.TotalDownTime,
+            TotalAlarmTime = Source.TotalAlarmTime,
+            TotalWaitTime = Source.TotalWaitTime,
+
+            -- KPI: Availability = RunTime / PlannedTime
+            AvailabilityPercent = 
+                CASE WHEN Source.TotalPlannedTime = 0 THEN NULL
+                     ELSE CAST(Source.TotalRunTime AS FLOAT) / Source.TotalPlannedTime
+                END,
+
+            -- KPI: Performance = GoodCount / Theoretical Max Per Hour (411 x 60 = 24,660)
+            PerformancePercent =
+                CAST(Source.TotalGoodCount AS FLOAT) / 24660.0,
+
+            -- KPI: Quality = Good / (Good + Rejects)
+            QualityPercent =
+                CASE WHEN (Source.TotalGoodCount + Source.TotalRejectCount) = 0 THEN NULL
+                     ELSE CAST(Source.TotalGoodCount AS FLOAT) / 
+                          (Source.TotalGoodCount + Source.TotalRejectCount)
+                END,
+
+            -- Manager-requested OEE calculation
+            -- OEE = (GoodCount / (411 x 60)) * 100
+            OEEPercent =
+                (CAST(Source.TotalGoodCount AS FLOAT) / (411 * 60)) * 100,
+
+            LastUpdated = GETDATE()
+
+    WHEN NOT MATCHED THEN
+        -- First time inserting this LotNumber + Hour
+        INSERT (
+            LotNumber, HourStart,
+            TotalGoodCount, TotalRejectCount,
+            TotalRunTime, TotalPlannedTime,
+            TotalDownTime, TotalAlarmTime, TotalWaitTime,
+            AvailabilityPercent, PerformancePercent, QualityPercent, OEEPercent,
+            LastUpdated
+        )
+        VALUES (
+            Source.LotNumber, Source.HourStart,
+            Source.TotalGoodCount, Source.TotalRejectCount,
+            Source.TotalRunTime, Source.TotalPlannedTime,
+            Source.TotalDownTime, Source.TotalAlarmTime, Source.TotalWaitTime,
+
+            -- Insert calculation copies the same logic
+            CASE WHEN Source.TotalPlannedTime = 0 THEN NULL
+                 ELSE CAST(Source.TotalRunTime AS FLOAT) / Source.TotalPlannedTime
+            END,
+
+            CAST(Source.TotalGoodCount AS FLOAT) / 24660.0,
+
+            CASE WHEN (Source.TotalGoodCount + Source.TotalRejectCount) = 0 THEN NULL
+                 ELSE CAST(Source.TotalGoodCount AS FLOAT) / 
+                      (Source.TotalGoodCount + Source.TotalRejectCount)
+            END,
+
+            (CAST(Source.TotalGoodCount AS FLOAT) / (411 * 60)) * 100,
+
+            GETDATE()
+        );
+END;
